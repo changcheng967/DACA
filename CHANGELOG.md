@@ -5,6 +5,39 @@ All notable changes to DACA will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-03-08
+
+### Fixed
+
+#### CRITICAL: DaCAAttention is now nn.Cell (not a workaround)
+- **DaCAAttention directly inherits from mindspore.nn.Cell** — the main class
+  that users import, that FlashAttention aliases to, and that
+  scaled_dot_product_attention creates. In v0.1.2, only a factory function
+  workaround (`create_daca_attention_cell`) provided nn.Cell support.
+  Now `DaCAAttention` itself IS the nn.Cell. Gradients flow correctly.
+- Deleted `create_daca_attention_cell()` factory and `_DaCAAttentionCellImpl`
+  inner class — no longer needed.
+- Deleted manual `__call__` and `forward` methods that bypassed nn.Cell autograd.
+- Added `use_recompute` parameter for gradient checkpointing.
+
+#### MindFormers attention patching now works
+- `patch_attention()` now actually replaces FlashAttention construct methods
+  in MindFormers modules with DaCAAttention-based implementations.
+- Defensively tries multiple MindFormers module paths (Qwen, LLaMA, generic).
+- `revert_attention()` properly restores original methods.
+- Supports Qwen3-8B model attention (the user's target model).
+
+### Added
+- `test_daca_attention_is_nn_cell` — verifies DaCAAttention is nn.Cell
+- `test_daca_attention_backward` — verifies gradients flow through attention
+- `test_daca_attention_graph_mode` — verifies graph mode compatibility
+- `test_daca_attention_correctness_tight_tolerance` — fp32 comparison with 0.01 tolerance
+
+### Changed
+- DaCAAttention constructor signature now includes all parameters directly
+  (no longer relies on factory function)
+- Updated README.md with correct FlashAttention example and training-ready feature
+
 ## [0.1.2] - 2026-03-08
 
 ### Fixed

@@ -4,6 +4,7 @@ Core NN layers with Ascend-specific fixes and optimizations.
 
 Key components:
 - DaCAAttention: Chunked online softmax attention (FlashAttention-equivalent, pure MindSpore)
+  - Now inherits from mindspore.nn.Cell for full autograd support
 - FlashAttention: Alias for DaCAAttention (backward compatible)
 - LayerNorm: fp32 upcast to avoid CANN fusion bug
 - RMSNorm: Manual decomposition using rsqrt + mul + mul

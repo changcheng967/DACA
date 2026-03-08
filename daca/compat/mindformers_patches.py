@@ -33,7 +33,7 @@ def apply_all() -> None:
     Applies:
     1. bf16 config patch (bf16 -> fp16)
     2. LayerNorm usage patch
-    3. FlashAttention → DaCAAttention replacement
+    3. FlashAttention -> DaCAAttention replacement
     4. Disable MS_ENABLE_FLASH_ATTENTION
 
     Example:
@@ -73,6 +73,7 @@ def revert_all() -> None:
 
     revert_bf16_config()
     revert_layernorm_usage()
+    revert_attention()
 
     _patches_applied = False
     logger.info("Reverted all MindFormers patches")
@@ -161,6 +162,7 @@ def patch_layernorm_usage() -> None:
 
             # Patch LayerNorm construction in LlamaModel
             original_construct = LlamaModel.construct
+            _original_configs["LlamaModel.construct"] = original_construct
 
             def patched_construct(self, *args, **kwargs):
                 # Use fp32 LayerNorm via daca
@@ -185,7 +187,19 @@ def revert_layernorm_usage() -> None:
         >>> from daca.compat.mindformers_patches import revert_layernorm_usage
         >>> revert_layernorm_usage()
     """
-    logger.info("MindFormers LayerNorm usage patches marked for removal")
+    # Restore original construct methods
+    for key, original in list(_original_configs.items()):
+        if key.endswith(".construct"):
+            module_key = key.rsplit(".construct", 1)[0]
+            try:
+                if module_key == "LlamaModel":
+                    from mindformers.models.llama import LlamaModel
+                    LlamaModel.construct = original
+                    logger.info(f"Reverted {key}")
+            except Exception as e:
+                logger.debug(f"Could not revert {key}: {e}")
+
+    logger.info("MindFormers LayerNorm usage patches reverted")
 
 
 def patch_attention() -> None:
@@ -200,52 +214,169 @@ def patch_attention() -> None:
         >>> from daca.compat.mindformers_patches import patch_attention
         >>> patch_attention()
     """
+    # Approach 1: Patch mindformers.modules.layers.FlashAttention if it exists
+    _try_patch_flash_attention_class()
+
+    # Approach 2: Patch the FlashAttention import in model files
+    _try_patch_model_attention_modules()
+
+    # Approach 3: Ensure env vars disable native FA
+    os.environ["MS_ENABLE_FLASH_ATTENTION"] = "0"
+    os.environ["MF_ENABLE_FLASH_ATTENTION"] = "0"
+    os.environ["MS_DEV_GRAPH_KERNEL_FLAGS"] = os.environ.get(
+        "MS_DEV_GRAPH_KERNEL_FLAGS", ""
+    ) + " --disable_pass=FlashAttentionFusionV1,FlashAttentionFusionV2"
+
+    logger.info("MindFormers attention patching complete")
+
+
+def _try_patch_flash_attention_class():
+    """Try to patch MindFormers FlashAttention class."""
     try:
-        import mindformers
+        from mindformers.modules import attention as mf_attn_module
 
-        # Patch MindFormers attention modules
-        try:
-            from mindformers.modules.layers import FlashAttention
+        # Look for FlashAttention class
+        if hasattr(mf_attn_module, 'FlashAttention'):
+            original_cls = mf_attn_module.FlashAttention
+            _original_configs["mf_FlashAttention_cls"] = original_cls
 
-            # Store original for potential revert
-            _original_configs["FlashAttention"] = FlashAttention
+            original_construct = original_cls.construct
+            _original_configs["mf_FlashAttention_construct"] = original_construct
 
-            # Patch to use DaCAAttention
-            def patched_flash_attention_init(self, *args, **kwargs):
-                # Inject DaCAAttention usage
-                logger.debug("MindFormers FlashAttention patched to use DaCAAttention")
+            def patched_construct(self, query, key, value, attention_mask=None, **kwargs):
+                """Patched to use DaCAAttention instead of native FlashAttention."""
+                # Infer dimensions
+                q_shape = query.shape
+                if len(q_shape) == 4:
+                    if q_shape[1] < q_shape[2]:
+                        num_heads = q_shape[1]
+                        head_dim = q_shape[3]
+                    else:
+                        num_heads = q_shape[2]
+                        head_dim = q_shape[3]
+                else:
+                    # Fall back to original if unexpected shape
+                    logger.warning(f"Unexpected query shape {q_shape}, falling back to original")
+                    return original_construct(self, query, key, value, attention_mask, **kwargs)
 
-            # Note: Full patching would require more extensive modification
-            # of MindFormers internals. The key is that users should use
-            # DaCAAttention directly or configure MindFormers to not use
-            # native FlashAttention via MS_ENABLE_FLASH_ATTENTION=0
-            logger.info("Marked MindFormers FlashAttention for patching")
+                from daca.nn.attention import DaCAAttention
+                daca_attn = DaCAAttention(
+                    num_heads=num_heads,
+                    num_kv_heads=num_heads,  # assume MHA unless we can detect GQA
+                    head_dim=head_dim,
+                    causal=True,
+                )
+                return daca_attn(query, key, value, attention_mask)
 
-        except (ImportError, AttributeError):
-            pass
-
-        # Patch any global MindFormers settings
-        # This ensures MindFormers doesn't try to use native FA
-        try:
-            import os
-            os.environ["MS_ENABLE_FLASH_ATTENTION"] = "0"
-            os.environ["MF_ENABLE_FLASH_ATTENTION"] = "0"
-            logger.info("Disabled MindFormers native FlashAttention")
-        except Exception:
-            pass
+            original_cls.construct = patched_construct
+            logger.info("Patched mindformers.modules.attention.FlashAttention.construct")
 
     except ImportError:
-        logger.debug("MindFormers not available, attention patch skipped")
+        logger.debug("mindformers.modules.attention not available")
+    except Exception as e:
+        logger.warning(f"Failed to patch MindFormers FlashAttention class: {e}")
+
+
+def _try_patch_model_attention_modules():
+    """Try to patch attention in specific model implementations."""
+
+    # Try Qwen models (user trains Qwen3-8B)
+    _try_patch_module_attr("mindformers.models.qwen2", "FlashAttention")
+    _try_patch_module_attr("mindformers.models.qwen2.qwen2_modules", "FlashAttention")
+
+    # Try LLaMA models
+    _try_patch_module_attr("mindformers.models.llama", "FlashAttention")
+    _try_patch_module_attr("mindformers.models.llama.llama_layer", "FlashAttention")
+    _try_patch_module_attr("mindformers.models.llama.llama_layer", "LLamaAttention")
+
+    # Try generic transformer layers
+    _try_patch_module_attr("mindformers.modules.transformer", "FlashAttention")
+    _try_patch_module_attr("mindformers.modules.layers", "FlashAttention")
+
+
+def _try_patch_module_attr(module_path: str, attr_name: str):
+    """Try to patch a specific attribute in a module.
+
+    Args:
+        module_path: Full module path (e.g., "mindformers.models.llama")
+        attr_name: Attribute name to patch (e.g., "FlashAttention")
+    """
+    try:
+        import importlib
+        mod = importlib.import_module(module_path)
+        if hasattr(mod, attr_name):
+            original = getattr(mod, attr_name)
+            key = f"{module_path}.{attr_name}"
+            _original_configs[key] = original
+
+            # If it's a class with a construct method, patch construct
+            if hasattr(original, 'construct') and callable(original.construct):
+                original_construct = original.construct
+                _original_configs[f"{key}.construct"] = original_construct
+
+                def make_patched(orig_construct):
+                    def patched_construct(self, query, key, value, attention_mask=None, **kwargs):
+                        q_shape = query.shape
+                        if len(q_shape) == 4:
+                            num_heads = min(q_shape[1], q_shape[2])
+                            head_dim = q_shape[3]
+                        else:
+                            return orig_construct(self, query, key, value, attention_mask, **kwargs)
+
+                        from daca.nn.attention import DaCAAttention
+                        daca_attn = DaCAAttention(
+                            num_heads=num_heads,
+                            num_kv_heads=num_heads,
+                            head_dim=head_dim,
+                            causal=True,
+                        )
+                        return daca_attn(query, key, value, attention_mask)
+                    return patched_construct
+
+                original.construct = make_patched(original_construct)
+                logger.info(f"Patched {key}.construct -> DaCAAttention")
+
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug(f"Could not patch {module_path}.{attr_name}: {e}")
 
 
 def revert_attention() -> None:
-    """Revert attention patches.
+    """Revert attention patches using stored originals.
 
     Example:
         >>> from daca.compat.mindformers_patches import revert_attention
         >>> revert_attention()
     """
-    logger.info("MindFormers attention patches marked for removal")
+    for key, original in list(_original_configs.items()):
+        if key.endswith(".construct"):
+            # Restore construct method
+            if key == "mf_FlashAttention_construct":
+                try:
+                    from mindformers.modules import attention as mf_attn_module
+                    if hasattr(mf_attn_module, 'FlashAttention'):
+                        mf_attn_module.FlashAttention.construct = original
+                        logger.info(f"Reverted {key}")
+                except Exception as e:
+                    logger.debug(f"Could not revert {key}: {e}")
+            elif "." in key:
+                module_key = key.rsplit(".construct", 1)[0]
+                parts = module_key.rsplit(".", 1)
+                if len(parts) == 2:
+                    module_path, attr_name = parts
+                    try:
+                        import importlib
+                        mod = importlib.import_module(module_path)
+                        cls = getattr(mod, attr_name, None)
+                        if cls and hasattr(cls, 'construct'):
+                            cls.construct = original
+                            logger.info(f"Reverted {key}")
+                    except Exception as e:
+                        logger.debug(f"Could not revert {key}: {e}")
+
+    _original_configs.clear()
+    logger.info("MindFormers attention patches reverted")
 
 
 def _rewrite_config_dtype(config: Any) -> Any:
@@ -257,7 +388,10 @@ def _rewrite_config_dtype(config: Any) -> Any:
     Returns:
         Config with bf16 replaced by fp16.
     """
-    import mindspore.common.dtype as mstype
+    try:
+        import mindspore.common.dtype as mstype
+    except ImportError:
+        return config
 
     # Handle dict-like configs
     if isinstance(config, dict):
@@ -291,7 +425,11 @@ def _rewrite_dict_dtype(config: dict) -> dict:
     Returns:
         Config with bf16 replaced by fp16.
     """
-    import mindspore.common.dtype as mstype
+    try:
+        import mindspore.common.dtype as mstype
+    except ImportError:
+        return config
+
     import copy
 
     config = copy.deepcopy(config)

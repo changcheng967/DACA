@@ -18,7 +18,7 @@ Example:
     daca.unpatch()
 """
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __author__ = "DACA Contributors"
 __license__ = "Apache-2.0"
 
@@ -91,7 +91,7 @@ def info() -> None:
 ║  DaCAAttention: Chunked Online Softmax Attention              ║
 ║  (FlashAttention-equivalent, pure MindSpore, w/ backward)     ║
 ║                                                               ║
-║  v0.1.2: All NN classes inherit from nn.Cell for autograd     ║
+║  v0.1.3: DaCAAttention IS nn.Cell - full autograd + MF patch  ║
 ╚═══════════════════════════════════════════════════════════════╝
 """
     print(banner)

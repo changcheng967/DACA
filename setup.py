@@ -7,7 +7,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="daca",
-    version="0.1.2",
+    version="0.1.3",
     author="DACA Contributors",
     author_email="changcheng967@users.noreply.github.com",
     description="DaVinci Accelerated Compute Architecture - Ascend NPU Platform Library",

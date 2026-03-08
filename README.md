@@ -11,10 +11,11 @@ A compute platform library that makes Ascend 910ProA NPUs fully usable for AI wo
 ## Features
 
 - **Pure Python** - No sudo, no custom kernels, runs on OpenI virtual machines
+- **Training Ready** - All NN modules are nn.Cell with full backward pass support
 - **bf16 Shim** - Transparent bf16 → fp16 conversion (hardware doesn't support bf16)
 - **LayerNorm Fix** - fp32 upcast workaround for CANN fusion bug
 - **Missing Operators** - SiLU, SwiGLU, and other missing ops implemented
-- **FlashAttention** - Native kernel wrapper with BMM fallback
+- **FlashAttention** - Chunked online softmax (pure MindSpore, full autograd)
 - **Graph Mode** - Safe environment variables for stable compilation
 - **MindFormers Compatible** - Patches for seamless integration
 
@@ -53,8 +54,8 @@ normalized = ln(x)  # Uses fp32 upcast internally
 
 # Use FlashAttention
 from daca.nn import FlashAttention
-attn = FlashAttention(head_dim=64, num_heads=32)
-output = attn(query, key, value)
+attn = FlashAttention(num_heads=32, num_kv_heads=8, head_dim=64)  # GQA-ready
+output = attn(query, key, value)  # Full autograd support (nn.Cell)
 
 # When done, restore original state
 daca.unpatch()

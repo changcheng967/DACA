@@ -34,6 +34,22 @@ class TestDaCAAttention:
         assert attn.q_chunk_size == 256
         assert attn.kv_chunk_size == 256
 
+    def test_daca_attention_is_nn_cell(self):
+        """Test that the main DaCAAttention class IS an nn.Cell."""
+        import mindspore.nn as nn
+        from daca.nn import DaCAAttention
+
+        attn = DaCAAttention(num_heads=4, num_kv_heads=4, head_dim=16)
+        assert isinstance(attn, nn.Cell), "DaCAAttention must inherit from nn.Cell for autograd"
+
+    def test_flash_attention_alias_is_nn_cell(self):
+        """Test that FlashAttention alias is also an nn.Cell."""
+        import mindspore.nn as nn
+        from daca.nn import FlashAttention
+
+        attn = FlashAttention(num_heads=4, num_kv_heads=4, head_dim=16)
+        assert isinstance(attn, nn.Cell)
+
     def test_daca_attention_forward_basic(self, sample_attention_inputs):
         """Test DaCAAttention basic forward pass."""
         from daca.nn import DaCAAttention
@@ -196,6 +212,42 @@ class TestDaCAAttention:
         # Allow some numerical tolerance
         assert max_diff < 0.1, f"Max diff: {max_diff}"
 
+    def test_daca_attention_correctness_tight_tolerance(self):
+        """Compare chunked vs naive with tighter tolerance (0.01) using fp32."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        import mindspore.ops as ops
+        from daca.nn import DaCAAttention
+
+        batch, heads, seq, dim = 1, 2, 8, 4
+
+        # Use float32 for tighter comparison
+        ms.numpy.random.seed(123)
+        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+
+        # Chunked with small chunks
+        attn = DaCAAttention(
+            num_heads=heads,
+            num_kv_heads=heads,
+            head_dim=dim,
+            causal=False,
+            q_chunk_size=4,
+            kv_chunk_size=4
+        )
+        chunked = attn(q, k, v)
+
+        # Naive
+        scale = 1.0 / (dim ** 0.5)
+        scores = ops.matmul(q, ops.transpose(k, (0, 1, 3, 2))) * scale
+        weights = ops.softmax(scores, axis=-1)
+        naive = ops.matmul(weights, v)
+
+        max_diff = float(ops.ReduceMax()(ops.Abs()(chunked - naive)))
+        assert max_diff < 0.01, f"Max diff {max_diff} exceeds 0.01 tolerance"
+
     def test_daca_attention_invalid_gqa(self):
         """Test that invalid GQA config raises error."""
         from daca.nn import DaCAAttention
@@ -216,8 +268,6 @@ class TestDaCAAttention:
         # Use distinct values for each position
         q = Tensor(ms.numpy.array([[[[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]]]), mstype.float16)
         k = Tensor(ms.numpy.array([[[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]]]), mstype.float16)
-        v = Tensor(ms.numpy.array([[[[1.0], [2.0], [3.0], [4.0]]]]), mstype.float16)
-        # Reshape v to match dim
         v = Tensor(ms.numpy.array([[[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]]]]), mstype.float16)
 
         attn = DaCAAttention(
@@ -232,38 +282,60 @@ class TestDaCAAttention:
         # We just verify it runs without error; detailed correctness is in correctness test
         assert output.shape == (batch, heads, seq, dim)
 
-    def test_daca_attention_cell_creation(self):
-        """Test creating nn.Cell version of DaCAAttention."""
-        from daca.nn.attention import create_daca_attention_cell
-
-        attn_cell = create_daca_attention_cell(
-            num_heads=8,
-            num_kv_heads=8,
-            head_dim=64,
-            use_recompute=False,
-        )
-
-        # Check it's an nn.Cell
-        import mindspore.nn as nn
-        assert isinstance(attn_cell, nn.Cell)
-
-    def test_daca_attention_cell_forward(self):
-        """Test nn.Cell attention forward pass."""
+    def test_daca_attention_backward(self):
+        """Test DaCAAttention backward pass - THE critical test for training."""
         import mindspore as ms
         from mindspore import Tensor
         import mindspore.common.dtype as mstype
-        from daca.nn.attention import create_daca_attention_cell
+        import mindspore.ops as ops
+        from daca.nn import DaCAAttention
 
-        batch, heads, seq, dim = 1, 4, 8, 16
+        batch, heads, seq, dim = 1, 2, 4, 8
+        ms.set_context(mode=ms.PYNATIVE_MODE)
 
+        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+
+        attn = DaCAAttention(num_heads=heads, num_kv_heads=heads, head_dim=dim, causal=False)
+
+        def forward_fn(query, key, value):
+            out = attn(query, key, value)
+            return ops.ReduceMean()(out)
+
+        grad_fn = ms.value_and_grad(forward_fn, grad_position=(0, 1, 2))
+        loss, grads = grad_fn(q, k, v)
+
+        assert loss is not None, "Forward pass failed"
+        assert len(grads) == 3, f"Expected 3 gradients (q,k,v), got {len(grads)}"
+        assert grads[0].shape == q.shape, f"Grad shape mismatch: {grads[0].shape} vs {q.shape}"
+        assert grads[1].shape == k.shape
+        assert grads[2].shape == v.shape
+        # Gradients should not be all zeros
+        assert float(ops.ReduceSum()(ops.Abs()(grads[0]))) > 0, "Query gradient is all zeros"
+
+    def test_daca_attention_graph_mode(self):
+        """Test DaCAAttention works in graph mode (required for distributed training)."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import DaCAAttention
+
+        # Use CPU for CI testing (Ascend may not be available)
+        ms.set_context(mode=ms.GRAPH_MODE, device_target="CPU")
+
+        batch, heads, seq, dim = 1, 2, 4, 8
         q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
         k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
         v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
 
-        attn = create_daca_attention_cell(heads, heads, dim)
+        attn = DaCAAttention(num_heads=heads, num_kv_heads=heads, head_dim=dim)
         output = attn(q, k, v)
 
         assert output.shape == (batch, heads, seq, dim)
+
+        # Restore pynative for other tests
+        ms.set_context(mode=ms.PYNATIVE_MODE)
 
 
 class TestFlashAttention:
@@ -273,10 +345,11 @@ class TestFlashAttention:
         """Test FlashAttention creation."""
         from daca.nn import FlashAttention
 
-        attn = FlashAttention(head_dim=64, num_heads=32)
+        attn = FlashAttention(num_heads=32, num_kv_heads=8, head_dim=64)
 
-        assert attn.head_dim == 64
         assert attn.num_heads == 32
+        assert attn.num_kv_heads == 8
+        assert attn.head_dim == 64
 
     def test_flash_attention_forward(self, sample_attention_inputs):
         """Test FlashAttention forward pass."""
@@ -285,7 +358,7 @@ class TestFlashAttention:
         q, k, v = sample_attention_inputs
         batch, heads, seq, dim = q.shape
 
-        attn = FlashAttention(head_dim=dim, num_heads=heads)
+        attn = FlashAttention(num_heads=heads, num_kv_heads=heads, head_dim=dim)
         output = attn(q, k, v)
 
         assert output.shape == q.shape
@@ -594,33 +667,26 @@ class TestAutograd:
         assert len(grads) == 1
         assert grads[0].shape == x.shape
 
-    def test_daca_attention_cell_backward(self):
-        """Test DaCAAttention nn.Cell backward pass."""
+    def test_daca_attention_backward(self):
+        """Test DaCAAttention (nn.Cell) backward pass."""
         import mindspore as ms
         from mindspore import Tensor
         import mindspore.common.dtype as mstype
-        from daca.nn.attention import create_daca_attention_cell
+        from daca.nn import DaCAAttention
 
         batch, heads, seq, dim = 1, 2, 4, 8
+        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
+        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float32)
 
-        ms.numpy.random.seed(42)
-        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
-        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
-        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+        attn = DaCAAttention(num_heads=heads, num_kv_heads=heads, head_dim=dim, causal=False)
 
-        attn = create_daca_attention_cell(heads, heads, dim)
-
-        # Forward
-        output = attn(q, k, v)
-
-        # Compute gradient (backward)
         def forward_fn(query, key, value):
             return attn(query, key, value).sum()
 
         grad = ms.grad_all(forward_fn)
         grads = grad(q, k, v)
 
-        # Should get gradients for q, k, v
         assert grads is not None
         assert len(grads) == 3
 
