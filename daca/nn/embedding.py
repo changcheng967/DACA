@@ -11,15 +11,31 @@ Example:
 """
 
 import logging
+import math
 from typing import Optional, Any
 
 logger = logging.getLogger("daca.nn.embedding")
 
+try:
+    import mindspore.nn as nn
+    _HAS_NN = True
+except ImportError:
+    _HAS_NN = False
+    # Create a dummy base class for when MindSpore is not available
+    class nn:
+        class Cell:
+            """Dummy Cell class."""
+            def __init__(self):
+                pass
+            def construct(self, *args, **kwargs):
+                raise NotImplementedError("MindSpore is required")
 
-class Embedding:
+
+class Embedding(nn.Cell):
     """Embedding layer with Ascend optimizations.
 
     Maps token indices to dense vectors using a learnable embedding table.
+    Inherits from mindspore.nn.Cell for proper autograd support.
 
     Attributes:
         vocab_size: Size of the vocabulary.
@@ -49,6 +65,8 @@ class Embedding:
             dtype: Data type for the embedding table.
             scale_by_sqrt_dim: Whether to scale outputs by sqrt(dim).
         """
+        super().__init__()
+
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
@@ -67,37 +85,18 @@ class Embedding:
             # Initialize with normal distribution
             # std = 1.0 / sqrt(embedding_dim) is common
             std = 1.0 / np.sqrt(embedding_dim)
-            weight = np.random.normal(0, std, (vocab_size, embedding_dim)).astype(np.float32)
+            weight_data = np.random.normal(0, std, (vocab_size, embedding_dim)).astype(np.float32)
 
             self.weight = Parameter(
-                Tensor(weight, param_dtype),
+                Tensor(weight_data, param_dtype),
                 name="weight"
             )
 
-            # Zero out padding_idx row
-            if padding_idx is not None:
-                self._zero_padding_row()
+            # Store padding_idx for masking during forward pass
+            # (zeroing at init doesn't persist through training)
 
         except ImportError:
             self.weight = None
-
-    def _zero_padding_row(self) -> None:
-        """Zero out the padding index row."""
-        if self.padding_idx is None or self.weight is None:
-            return
-
-        try:
-            import mindspore.ops as ops
-            import mindspore as ms
-
-            # Create mask for padding row
-            mask = ops.ones((self.vocab_size, self.embedding_dim), self.weight.dtype)
-            mask[self.padding_idx, :] = 0
-
-            self.weight = self.weight * mask
-
-        except Exception as e:
-            logger.warning(f"Failed to zero padding row: {e}")
 
     def construct(self, input_ids: Any) -> Any:
         """Look up embeddings for token indices.
@@ -110,6 +109,7 @@ class Embedding:
         """
         try:
             import mindspore.ops as ops
+            import mindspore.common.dtype as mstype
         except ImportError:
             raise ImportError("MindSpore is required for Embedding")
 
@@ -117,16 +117,23 @@ class Embedding:
         # input_ids: (batch, seq) -> (batch, seq, dim)
         embeddings = ops.gather(self.weight, input_ids, 0)
 
+        # Zero out padding_idx if specified
+        if self.padding_idx is not None:
+            # Create mask: 0 at padding_idx, 1 elsewhere
+            mask = ops.ones((self.vocab_size, self.embedding_dim), self.weight.dtype)
+            mask = ops.tensor_scatter_update(
+                mask,
+                ops.expand_dims(ops.scalar_to_tensor(self.padding_idx, mstype.int32), 0),
+                ops.zeros((1, self.embedding_dim), self.weight.dtype)
+            )
+            # Apply mask (this zeros out the embedding at padding_idx for all positions)
+            embeddings = embeddings * ops.gather(mask, input_ids, 0)
+
         # Scale by sqrt(dim) if configured
         if self.scale_by_sqrt_dim:
-            import numpy as np
-            embeddings = embeddings * np.sqrt(self.embedding_dim)
+            embeddings = embeddings * math.sqrt(self.embedding_dim)
 
         return embeddings
-
-    def __call__(self, input_ids: Any) -> Any:
-        """Call construct method."""
-        return self.construct(input_ids)
 
 
 def embedding(
@@ -158,9 +165,9 @@ def embedding(
 
     # Zero out padding if specified
     if padding_idx is not None:
-        import numpy as np
         # Create mask
-        mask = (input_ids != padding_idx).astype(output.dtype)
+        mask = (input_ids != padding_idx)
+        mask = ops.cast(mask, output.dtype)
         mask = ops.expand_dims(mask, -1)
         output = output * mask
 

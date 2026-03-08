@@ -1,4 +1,11 @@
-"""Tests for DACA NN module."""
+"""Tests for DACA NN module.
+
+Includes tests for:
+- Basic forward passes
+- nn.Cell inheritance (autograd support)
+- Backward pass support
+- Graph mode compatibility
+"""
 
 import pytest
 
@@ -225,6 +232,39 @@ class TestDaCAAttention:
         # We just verify it runs without error; detailed correctness is in correctness test
         assert output.shape == (batch, heads, seq, dim)
 
+    def test_daca_attention_cell_creation(self):
+        """Test creating nn.Cell version of DaCAAttention."""
+        from daca.nn.attention import create_daca_attention_cell
+
+        attn_cell = create_daca_attention_cell(
+            num_heads=8,
+            num_kv_heads=8,
+            head_dim=64,
+            use_recompute=False,
+        )
+
+        # Check it's an nn.Cell
+        import mindspore.nn as nn
+        assert isinstance(attn_cell, nn.Cell)
+
+    def test_daca_attention_cell_forward(self):
+        """Test nn.Cell attention forward pass."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn.attention import create_daca_attention_cell
+
+        batch, heads, seq, dim = 1, 4, 8, 16
+
+        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+
+        attn = create_daca_attention_cell(heads, heads, dim)
+        output = attn(q, k, v)
+
+        assert output.shape == (batch, heads, seq, dim)
+
 
 class TestFlashAttention:
     """Tests for FlashAttention."""
@@ -309,6 +349,15 @@ class TestLayerNorm:
 
         assert output.dtype == mstype.float16
 
+    def test_layernorm_is_nn_cell(self):
+        """Test that LayerNorm inherits from nn.Cell."""
+        import mindspore.nn as nn
+        from daca.nn import LayerNorm
+
+        ln = LayerNorm(normalized_shape=768)
+
+        assert isinstance(ln, nn.Cell)
+
 
 class TestRMSNorm:
     """Tests for RMSNorm."""
@@ -329,6 +378,15 @@ class TestRMSNorm:
         output = rms(sample_tensor)
 
         assert output.shape == sample_tensor.shape
+
+    def test_rmsnorm_is_nn_cell(self):
+        """Test that RMSNorm inherits from nn.Cell."""
+        import mindspore.nn as nn
+        from daca.nn import RMSNorm
+
+        rms = RMSNorm(hidden_size=768)
+
+        assert isinstance(rms, nn.Cell)
 
 
 class TestActivations:
@@ -478,6 +536,93 @@ class TestEmbedding:
         output = emb(indices)
 
         assert output.shape == (2, 3, 32)
+
+    def test_embedding_is_nn_cell(self):
+        """Test that Embedding inherits from nn.Cell."""
+        import mindspore.nn as nn
+        from daca.nn import Embedding
+
+        emb = Embedding(vocab_size=100, embedding_dim=32)
+
+        assert isinstance(emb, nn.Cell)
+
+
+class TestAutograd:
+    """Tests for autograd support (backward pass)."""
+
+    def test_layernorm_backward(self):
+        """Test LayerNorm backward pass."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import LayerNorm
+
+        ms.numpy.random.seed(42)
+        x = Tensor(ms.numpy.random.randn(2, 4, 8), mstype.float16)
+        ln = LayerNorm(normalized_shape=8)
+
+        # Forward
+        output = ln(x)
+
+        # Compute gradient (backward)
+        grad = ms.grad_all(lambda inp: ln(inp).sum())
+        grads = grad(x)
+
+        assert grads is not None
+        assert len(grads) == 1
+        assert grads[0].shape == x.shape
+
+    def test_rmsnorm_backward(self):
+        """Test RMSNorm backward pass."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import RMSNorm
+
+        ms.numpy.random.seed(42)
+        x = Tensor(ms.numpy.random.randn(2, 4, 8), mstype.float16)
+        rms = RMSNorm(hidden_size=8)
+
+        # Forward
+        output = rms(x)
+
+        # Compute gradient (backward)
+        grad = ms.grad_all(lambda inp: rms(inp).sum())
+        grads = grad(x)
+
+        assert grads is not None
+        assert len(grads) == 1
+        assert grads[0].shape == x.shape
+
+    def test_daca_attention_cell_backward(self):
+        """Test DaCAAttention nn.Cell backward pass."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn.attention import create_daca_attention_cell
+
+        batch, heads, seq, dim = 1, 2, 4, 8
+
+        ms.numpy.random.seed(42)
+        q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+        k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+        v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+
+        attn = create_daca_attention_cell(heads, heads, dim)
+
+        # Forward
+        output = attn(q, k, v)
+
+        # Compute gradient (backward)
+        def forward_fn(query, key, value):
+            return attn(query, key, value).sum()
+
+        grad = ms.grad_all(forward_fn)
+        grads = grad(q, k, v)
+
+        # Should get gradients for q, k, v
+        assert grads is not None
+        assert len(grads) == 3
 
 
 # Fixtures

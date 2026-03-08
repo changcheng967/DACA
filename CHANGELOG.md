@@ -5,6 +5,94 @@ All notable changes to DACA will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-03-08
+
+### Fixed
+
+#### CRITICAL: Training Support (nn.Cell Conversion)
+- **All NN classes now inherit from mindspore.nn.Cell**: DaCAAttention, LayerNorm, RMSNorm, Embedding
+  now properly support autograd. Without nn.Cell inheritance, gradients would not flow through
+  these modules during backpropagation.
+- Added `create_daca_attention_cell()` factory function for explicit nn.Cell attention with
+  optional `use_recompute=True` for gradient checkpointing (saves memory during training).
+- Removed manual `__call__` methods - nn.Cell automatically routes `__call__` to `construct()`.
+
+#### CRITICAL: Graph Mode Compatibility
+- **Fixed in-place tensor assignment**: Changed from `output[:,:,q_start:q_end,:] = ...` to
+  `ops.concat(output_chunks, axis=2)`. In-place slice assignment fails in MindSpore graph mode.
+- **Fixed online softmax rescaling formula**: Removed incorrect rescaling factor `l_scale * l / l_new`
+  from intermediate updates. Now correctly accumulates unnormalized output and normalizes once
+  at the end: `o = o / (l + 1e-10)`.
+
+#### Performance Optimizations
+- **Causal mask caching**: Masks are now cached globally instead of recreating numpy arrays
+  every forward pass. Uses `_CAUSAL_MASK_CACHE` dict with `(q_start, q_end, kv_start, kv_end)` key.
+- **Added `use_recompute` parameter**: Optional gradient checkpointing for memory-efficient training.
+
+### Changed
+
+#### Code Quality
+- Added `Any` to typing imports in `daca/blas/matmul.py` (was causing NameError).
+- Removed duplicate `scaled_dot_product_attention` from `daca/nn/softmax.py` - use
+  `daca.nn.attention.scaled_dot_product_attention` instead.
+- Updated version to 0.1.2 in both `setup.py` and `daca/__init__.py`.
+
+### Added
+
+#### New Functions
+- `daca.nn.attention.create_daca_attention_cell()`: Factory function for nn.Cell attention.
+- `daca.nn.attention.repeat_kv()`: Functional interface for GQA key/value expansion.
+- `daca.nn.layernorm.layer_norm()`: Functional LayerNorm with fp32 upcast.
+- `daca.nn.rmsnorm.rms_norm()`: Functional RMSNorm.
+
+### Technical Details
+
+#### nn.Cell Inheritance Pattern
+
+Before (NO gradients):
+```python
+class LayerNorm:
+    def __init__(self, ...):
+        self.weight = Parameter(...)  # Not tracked!
+
+    def __call__(self, x):
+        return self.construct(x)
+
+    def construct(self, x):
+        return x * self.weight
+```
+
+After (proper autograd):
+```python
+class LayerNorm(nn.Cell):
+    def __init__(self, ...):
+        super().__init__()  # Required!
+        self.weight = Parameter(...)  # Now tracked by nn.Cell
+
+    def construct(self, x):  # No __call__ needed
+        return x * self.weight
+```
+
+#### Graph Mode Compatible Output Collection
+
+Before (BROKEN in graph mode):
+```python
+output = ops.zeros((B, H, S, D), dtype)
+for i in range(num_chunks):
+    # ... compute chunk_output ...
+    output[:, :, start:end, :] = chunk_output  # In-place assignment fails!
+return output
+```
+
+After (WORKS in graph mode):
+```python
+output_chunks = []
+for i in range(num_chunks):
+    # ... compute chunk_output ...
+    output_chunks.append(chunk_output)
+return ops.concat(output_chunks, axis=2)  # No in-place ops
+```
+
 ## [0.1.1] - 2026-03-08
 
 ### Fixed

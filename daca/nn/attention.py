@@ -6,13 +6,13 @@ chunked online softmax, which avoids materializing the full S×S attention matri
 
 WHY: Naive BMM-Softmax-BMM materializes the full [B,H,S,S] attention matrix.
 For Qwen3-8B (seq=4096, 32 heads): ~1GB per layer, ~36GB across 36 layers.
-This exceeds the 32GB HBM on each 910ProA NPU → OOM crash.
+This exceeds the 32GB HBM on each 910ProA NPU -> OOM crash.
 
 The chunked approach processes Q and K/V in small tiles, using the online
 softmax trick (Milakov & Gimelshein 2018) to combine partial softmax results
 without ever storing the full attention matrix.
 
-Memory: O(q_chunk × kv_chunk) instead of O(S²).
+Memory: O(q_chunk x kv_chunk) instead of O(S^2).
 With chunks of 256: ~4MB vs ~1GB per layer.
 
 Algorithm:
@@ -23,9 +23,9 @@ Algorithm:
             m_new = max(m, rowmax(s))
             p = exp(s - m_new)  # numerically stable
             l_new = exp(m - m_new) * l + rowsum(p)
-            o = diag(exp(m - m_new)) * (l / l_new) * o + diag(1/l_new) * p @ v_block
+            o = exp(m - m_new) * o + p @ v_block
             m, l = m_new, l_new
-        output[q_block_range] = o
+        output[q_block_range] = o / l  # final normalization
 
 Reference: FlashAttention (Dao et al. 2022), FastAttention (Milakov & Gimelshein 2018)
 
@@ -38,12 +38,15 @@ Example:
 
 import logging
 import math
-from typing import Optional, Tuple, Any, Union
+from typing import Optional, Tuple, Any, Union, List
 
 logger = logging.getLogger("daca.nn.attention")
 
 # Preferred input layout: [B, H, S, D] (batch, heads, sequence, dimension)
 # This matches MindSpore's BatchMatMul convention and is most efficient.
+
+# Global cache for causal masks
+_CAUSAL_MASK_CACHE: dict = {}
 
 
 class DaCAAttention:
@@ -53,7 +56,7 @@ class DaCAAttention:
     backward support on 910ProA. No custom kernels, no sudo required.
 
     Key features:
-    - Memory efficient: O(chunk²) instead of O(seq²)
+    - Memory efficient: O(chunk^2) instead of O(seq^2)
     - Backward support: All ops have gradients on 910ProA
     - GQA support: Handles different num_heads vs num_kv_heads
     - Causal masking: Per-chunk causal mask with block skip optimization
@@ -169,8 +172,6 @@ class DaCAAttention:
         v_shape = value.shape
 
         # Determine layout: [B, H, S, D] vs [B, S, H, D]
-        # In [B, H, S, D]: dim 1 is num_heads (small), dim 2 is seq (large)
-        # In [B, S, H, D]: dim 1 is seq (large), dim 2 is num_heads (small)
         if len(q_shape) == 4:
             if q_shape[1] == self.num_heads:
                 # Layout: [B, H, S, D] - preferred
@@ -294,10 +295,9 @@ class DaCAAttention:
 
         # Number of chunks
         num_q_chunks = (seq_len + q_chunk - 1) // q_chunk
-        num_kv_chunks = (seq_len + kv_chunk - 1) // kv_chunk
 
-        # Initialize output tensor
-        output = ops.zeros((batch_size, num_heads, seq_len, head_dim), query.dtype)
+        # Collect output chunks for final concat (graph-mode compatible)
+        output_chunks: List[Any] = []
 
         # Process each query chunk
         for i in range(num_q_chunks):
@@ -311,16 +311,16 @@ class DaCAAttention:
             # Initialize running statistics for this query chunk
             # m: running max for numerical stability [B, H, q_chunk, 1]
             # l: running sum of exp(scores - max) [B, H, q_chunk, 1]
-            # o: running output [B, H, q_chunk, D]
+            # o: running unnormalized output [B, H, q_chunk, D]
             m = ops.fill(mstype.float32, (batch_size, num_heads, actual_q_chunk, 1), float("-inf"))
             l = ops.zeros((batch_size, num_heads, actual_q_chunk, 1), mstype.float32)
             o = ops.zeros((batch_size, num_heads, actual_q_chunk, head_dim), mstype.float32)
 
             # Process each key/value chunk
+            num_kv_chunks = (seq_len + kv_chunk - 1) // kv_chunk
             for j in range(num_kv_chunks):
                 kv_start = j * kv_chunk
                 kv_end = min((j + 1) * kv_chunk, seq_len)
-                actual_kv_chunk = kv_end - kv_start
 
                 # Causal mask optimization: skip fully masked blocks
                 if causal:
@@ -336,7 +336,6 @@ class DaCAAttention:
                 # q_chunk: [B, H, q_chunk, D]
                 # k_chunk: [B, H, kv_chunk, D]
                 # scores: [B, H, q_chunk, kv_chunk]
-                # Use BatchMatMul for efficiency
                 scores = ops.BatchMatMul(transpose_b=True)(q_chunk_tensor, k_chunk_tensor)
 
                 # Apply scale
@@ -346,8 +345,8 @@ class DaCAAttention:
                 if causal:
                     # Only apply mask if this block is partially masked
                     if kv_end > q_start:
-                        mask = self._create_causal_mask_block(
-                            q_start, q_end, kv_start, kv_end, scores.dtype
+                        mask = self._get_cached_causal_mask(
+                            q_start, q_end, kv_start, kv_end
                         )
                         scores = scores + mask
 
@@ -376,45 +375,52 @@ class DaCAAttention:
                 # block_output: [B, H, q_chunk, D]
                 block_output = ops.BatchMatMul()(exp_scores, ops.cast(v_chunk_tensor, mstype.float32))
 
-                # Update running output
-                # o = (l_scale * l / l_new) * o + (1 / l_new) * block_output
-                # This is the online softmax rescaling formula
-                o_scale = l_scale * l / (l_new + 1e-10)  # Add epsilon for stability
-                o = o_scale * o + block_output / (l_new + 1e-10)
+                # Update running output (rescale previous output)
+                # o_new = exp(m - m_new) * o + block_output
+                o = l_scale * o + block_output
 
                 # Update running statistics
                 m = m_new
                 l = l_new
 
-            # Final output for this query chunk (already normalized by l)
-            # Cast back to original dtype
-            output[:, :, q_start:q_end, :] = ops.cast(o, query.dtype)
+            # Final normalization: o / l
+            # Add small epsilon for numerical stability
+            o = o / (l + 1e-10)
+
+            # Cast back to original dtype and collect for concat
+            output_chunks.append(ops.cast(o, query.dtype))
+
+        # Concat all output chunks (graph-mode compatible - no in-place assignment)
+        output = ops.concat(output_chunks, axis=2)
 
         return output
 
-    def _create_causal_mask_block(
+    def _get_cached_causal_mask(
         self,
         q_start: int,
         q_end: int,
         kv_start: int,
         kv_end: int,
-        dtype: Any,
     ) -> Any:
-        """Create causal mask for a single attention block.
+        """Get or create cached causal mask for a block.
 
-        For causal attention, position i can only attend to positions <= i.
+        Uses global cache to avoid recreating numpy arrays every forward pass.
 
         Args:
             q_start: Start index of query positions
             q_end: End index of query positions (exclusive)
             kv_start: Start index of key/value positions
             kv_end: End index of key/value positions (exclusive)
-            dtype: Data type for the mask tensor
 
         Returns:
             Mask tensor of shape [1, 1, q_chunk, kv_chunk]
             -inf where attention should be masked, 0 elsewhere
         """
+        cache_key = (q_start, q_end, kv_start, kv_end)
+
+        if cache_key in _CAUSAL_MASK_CACHE:
+            return _CAUSAL_MASK_CACHE[cache_key]
+
         try:
             import mindspore as ms
             from mindspore import Tensor
@@ -431,14 +437,12 @@ class DaCAAttention:
         kv_positions = np.arange(kv_start, kv_end).reshape(1, -1)  # [1, kv_len]
 
         # Causal mask: mask[i, j] = -inf if j > i, else 0
-        # Position j can be attended by position i only if j <= i
         mask = np.where(kv_positions > q_positions, float("-inf"), 0.0)
-        mask = mask.astype(np.float32)
+        mask = mask.astype(np.float32).reshape(1, 1, q_len, kv_len)
 
-        # Expand to [1, 1, q_len, kv_len] for broadcasting
-        mask = mask.reshape(1, 1, q_len, kv_len)
-
-        return Tensor(mask, dtype=mstype.float32)
+        result = Tensor(mask, dtype=mstype.float32)
+        _CAUSAL_MASK_CACHE[cache_key] = result
+        return result
 
     def forward(self, query: Any, key: Any, value: Any, **kwargs) -> Any:
         """Alias for construct() for compatibility."""
@@ -550,3 +554,208 @@ def repeat_kv(hidden_states: Any, n_rep: int) -> Any:
     )
 
     return hidden_states
+
+
+def create_daca_attention_cell(
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_chunk_size: int = 256,
+    kv_chunk_size: int = 256,
+    causal: bool = True,
+    dropout_rate: float = 0.0,
+    scale: Optional[float] = None,
+    use_recompute: bool = False,
+):
+    """Create a DaCAAttention wrapped in nn.Cell for autograd support.
+
+    Use this when you need full autograd support (backpropagation).
+    The returned nn.Cell can be used directly in MindSpore training pipelines.
+
+    Args:
+        num_heads: Number of query attention heads.
+        num_kv_heads: Number of key/value heads.
+        head_dim: Dimension of each attention head.
+        q_chunk_size: Chunk size for query dimension.
+        kv_chunk_size: Chunk size for key/value dimension.
+        causal: Whether to apply causal masking.
+        dropout_rate: Dropout probability.
+        scale: Scale factor. Default: 1/sqrt(head_dim).
+        use_recompute: Enable gradient checkpointing for memory efficiency.
+
+    Returns:
+        mindspore.nn.Cell implementing chunked attention.
+
+    Example:
+        >>> from daca.nn.attention import create_daca_attention_cell
+        >>> attn = create_daca_attention_cell(32, 8, 128, use_recompute=True)
+        >>> # Use in training pipeline with full autograd support
+    """
+    try:
+        import mindspore.nn as nn
+        import mindspore.ops as ops
+        import mindspore.common.dtype as mstype
+        from mindspore import Parameter, Tensor
+        import numpy as np
+    except ImportError:
+        raise ImportError("MindSpore is required")
+
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by "
+            f"num_kv_heads ({num_kv_heads}) for GQA"
+        )
+
+    n_rep = num_heads // num_kv_heads
+    if scale is None:
+        scale = 1.0 / math.sqrt(head_dim)
+
+    class _DaCAAttentionCellImpl(nn.Cell):
+        """Internal nn.Cell implementation of chunked attention."""
+
+        def __init__(self):
+            super().__init__()
+            self.num_heads = num_heads
+            self.num_kv_heads = num_kv_heads
+            self.head_dim = head_dim
+            self.q_chunk_size = q_chunk_size
+            self.kv_chunk_size = kv_chunk_size
+            self.causal = causal
+            self.dropout_rate = dropout_rate
+            self.scale = scale
+            self.n_rep = n_rep
+            self.use_recompute = use_recompute
+
+            if use_recompute:
+                self.recompute()
+
+        def construct(self, query, key, value, attention_mask=None):
+            # Detect layout
+            q_shape = query.shape
+            if q_shape[1] == self.num_heads:
+                input_layout = "BHSD"
+                batch_size = q_shape[0]
+                seq_len = q_shape[2]
+            elif q_shape[2] == self.num_heads:
+                input_layout = "BSHD"
+                batch_size = q_shape[0]
+                seq_len = q_shape[1]
+                query = ops.transpose(query, (0, 2, 1, 3))
+                key = ops.transpose(key, (0, 2, 1, 3))
+                value = ops.transpose(value, (0, 2, 1, 3))
+            else:
+                raise ValueError(f"Cannot determine input layout from shape {q_shape}")
+
+            # Handle GQA
+            if self.n_rep > 1:
+                key = self._repeat_kv(key, self.n_rep)
+                value = self._repeat_kv(value, self.n_rep)
+
+            # Compute chunked attention
+            output = self._chunked_attention(query, key, value, batch_size, seq_len)
+
+            # Restore layout
+            if input_layout == "BSHD":
+                output = ops.transpose(output, (0, 2, 1, 3))
+
+            return output
+
+        def _repeat_kv(self, hidden_states, n_rep):
+            if n_rep == 1:
+                return hidden_states
+            batch, num_kv, seq, dim = hidden_states.shape
+            hidden_states = ops.expand_dims(hidden_states, 2)
+            hidden_states = ops.tile(hidden_states, (1, 1, n_rep, 1, 1))
+            return ops.reshape(hidden_states, (batch, num_kv * n_rep, seq, dim))
+
+        def _chunked_attention(self, query, key, value, batch_size, seq_len):
+            num_heads = self.num_heads
+            head_dim = self.head_dim
+            q_chunk = self.q_chunk_size
+            kv_chunk = self.kv_chunk_size
+            scale = self.scale
+            causal = self.causal
+
+            num_q_chunks = (seq_len + q_chunk - 1) // q_chunk
+            output_chunks = []
+
+            for i in range(num_q_chunks):
+                q_start = i * q_chunk
+                q_end = min((i + 1) * q_chunk, seq_len)
+                actual_q_chunk = q_end - q_start
+
+                q_chunk_tensor = query[:, :, q_start:q_end, :]
+
+                m = ops.fill(mstype.float32, (batch_size, num_heads, actual_q_chunk, 1), float("-inf"))
+                l = ops.zeros((batch_size, num_heads, actual_q_chunk, 1), mstype.float32)
+                o = ops.zeros((batch_size, num_heads, actual_q_chunk, head_dim), mstype.float32)
+
+                num_kv_chunks = (seq_len + kv_chunk - 1) // kv_chunk
+                for j in range(num_kv_chunks):
+                    kv_start = j * kv_chunk
+                    kv_end = min((j + 1) * kv_chunk, seq_len)
+
+                    if causal and kv_start > q_end - 1:
+                        continue
+
+                    k_chunk_tensor = key[:, :, kv_start:kv_end, :]
+                    v_chunk_tensor = value[:, :, kv_start:kv_end, :]
+
+                    scores = ops.BatchMatMul(transpose_b=True)(q_chunk_tensor, k_chunk_tensor)
+                    scores = scores * scale
+
+                    if causal and kv_end > q_start:
+                        mask = _get_cached_causal_mask_global(q_start, q_end, kv_start, kv_end)
+                        scores = scores + mask
+
+                    scores_fp32 = ops.cast(scores, mstype.float32)
+                    m_block = ops.max(scores_fp32, axis=-1, keep_dims=True)[0]
+                    m_new = ops.maximum(m, m_block)
+                    exp_scores = ops.exp(scores_fp32 - m_new)
+
+                    if self.dropout_rate > 0:
+                        exp_scores = ops.dropout(exp_scores, p=self.dropout_rate)
+
+                    l_scale = ops.exp(m - m_new)
+                    l_new = l_scale * l + ops.sum(exp_scores, axis=-1, keep_dims=True)
+                    block_output = ops.BatchMatMul()(exp_scores, ops.cast(v_chunk_tensor, mstype.float32))
+
+                    o = l_scale * o + block_output
+                    m = m_new
+                    l = l_new
+
+                o = o / (l + 1e-10)
+                output_chunks.append(ops.cast(o, query.dtype))
+
+            return ops.concat(output_chunks, axis=2)
+
+    return _DaCAAttentionCellImpl()
+
+
+def _get_cached_causal_mask_global(q_start, q_end, kv_start, kv_end):
+    """Global function for cached causal mask."""
+    cache_key = (q_start, q_end, kv_start, kv_end)
+
+    if cache_key in _CAUSAL_MASK_CACHE:
+        return _CAUSAL_MASK_CACHE[cache_key]
+
+    try:
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        import numpy as np
+    except ImportError:
+        raise ImportError("MindSpore is required")
+
+    q_len = q_end - q_start
+    kv_len = kv_end - kv_start
+
+    q_positions = np.arange(q_start, q_end).reshape(-1, 1)
+    kv_positions = np.arange(kv_start, kv_end).reshape(1, -1)
+
+    mask = np.where(kv_positions > q_positions, float("-inf"), 0.0)
+    mask = mask.astype(np.float32).reshape(1, 1, q_len, kv_len)
+
+    result = Tensor(mask, dtype=mstype.float32)
+    _CAUSAL_MASK_CACHE[cache_key] = result
+    return result

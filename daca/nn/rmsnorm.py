@@ -14,16 +14,33 @@ Example:
 """
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger("daca.nn.rmsnorm")
 
+try:
+    import mindspore.nn as nn
+    _HAS_NN = True
+except ImportError:
+    _HAS_NN = False
+    # Create a dummy base class for when MindSpore is not available
+    class nn:
+        class Cell:
+            """Dummy Cell class."""
+            def __init__(self):
+                pass
+            def construct(self, *args, **kwargs):
+                raise NotImplementedError("MindSpore is required")
 
-class RMSNorm:
+
+class RMSNorm(nn.Cell):
     """Root Mean Square Layer Normalization.
 
     RMSNorm normalizes by the root mean square without centering
     (no mean subtraction). More efficient than LayerNorm.
+
+    This class inherits from mindspore.nn.Cell for proper autograd support.
+    The weight parameter is registered as mindspore.Parameter for gradient tracking.
 
     Attributes:
         hidden_size: Size of the last dimension.
@@ -53,6 +70,8 @@ class RMSNorm:
             epsilon: Small constant for numerical stability.
             dtype: Data type for weight parameter.
         """
+        super().__init__()
+
         self.hidden_size = hidden_size
         self.epsilon = epsilon
 
@@ -89,8 +108,6 @@ class RMSNorm:
         except ImportError:
             raise ImportError("MindSpore is required for RMSNorm")
 
-        original_dtype = hidden_states.dtype
-
         # Compute variance (mean of squared values)
         variance = ops.mean(
             ops.pow(hidden_states, 2),
@@ -108,12 +125,12 @@ class RMSNorm:
 
         return hidden_states
 
-    def __call__(self, hidden_states: Any) -> Any:
-        """Call construct method."""
-        return self.construct(hidden_states)
 
-
-def rms_norm(hidden_states: Any, weight: Any, epsilon: float = 1e-6) -> Any:
+def rms_norm(
+    hidden_states: Any,
+    weight: Any,
+    epsilon: float = 1e-6,
+) -> Any:
     """Functional RMSNorm.
 
     Args:

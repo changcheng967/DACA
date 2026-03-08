@@ -23,17 +23,36 @@ logger = logging.getLogger("daca.nn.layernorm")
 _fp32_upcast_enabled: bool = False
 _original_layer_norm: Optional[Any] = None
 
+try:
+    import mindspore.nn as nn
+    _HAS_NN = True
+except ImportError:
+    _HAS_NN = False
+    # Create a dummy base class for when MindSpore is not available
+    class nn:
+        class Cell:
+            """Dummy Cell class."""
+            def __init__(self):
+                pass
+            def construct(self, *args, **kwargs):
+                raise NotImplementedError("MindSpore is required")
 
-class LayerNorm:
+
+class LayerNorm(nn.Cell):
     """LayerNorm with automatic fp32 upcast.
 
     Normalizes across the last dimension, with automatic upcasting
     to fp32 to avoid CANN fusion bugs on Ascend.
 
+    This class inherits from mindspore.nn.Cell for proper autograd support.
+    All parameters are registered as mindspore.Parameter for gradient tracking.
+
     Attributes:
         normalized_shape: Shape of normalized dimensions.
         epsilon: Small constant for numerical stability.
         elementwise_affine: Whether to use learnable affine parameters.
+        weight: Learnable scale parameter (gamma).
+        bias: Learnable shift parameter (beta).
 
     Example:
         >>> ln = LayerNorm(768, epsilon=1e-6)
@@ -56,6 +75,8 @@ class LayerNorm:
             elementwise_affine: Whether to use learnable gamma/beta.
             dtype: Data type for parameters.
         """
+        super().__init__()
+
         self.normalized_shape = normalized_shape
         self.epsilon = epsilon
         self.elementwise_affine = elementwise_affine
@@ -81,6 +102,7 @@ class LayerNorm:
                     name="bias"
                 )
             else:
+                # Create dummy parameters that won't be used
                 self.weight = None
                 self.bias = None
 
@@ -136,19 +158,15 @@ class LayerNorm:
 
         return hidden_states
 
-    def __call__(self, hidden_states: Any) -> Any:
-        """Call construct method."""
-        return self.construct(hidden_states)
-
 
 def enable_fp32_upcast() -> None:
-    """Enable fp32 upcast for all LayerNorm operations.
+    """Enable fp32 upcast for all MindSpore LayerNorm operations.
 
-    This patches MindSpore's LayerNorm to automatically upcast
+    This patches MindSpore's nn.LayerNorm to automatically upcast
     fp16 inputs to fp32 before normalization.
 
     Example:
-        >>> from daca.nn import enable_fp32_upcast
+        >>> from daca.nn.layernorm import enable_fp32_upcast
         >>> enable_fp32_upcast()
     """
     global _fp32_upcast_enabled, _original_layer_norm
@@ -199,10 +217,10 @@ def enable_fp32_upcast() -> None:
 
 
 def disable_fp32_upcast() -> None:
-    """Disable fp32 upcast and restore original LayerNorm.
+    """Disable fp32 upcast and restore original MindSpore LayerNorm.
 
     Example:
-        >>> from daca.nn import disable_fp32_upcast
+        >>> from daca.nn.layernorm import disable_fp32_upcast
         >>> disable_fp32_upcast()
     """
     global _fp32_upcast_enabled, _original_layer_norm
@@ -225,3 +243,64 @@ def disable_fp32_upcast() -> None:
         pass
     except Exception as e:
         logger.warning(f"Failed to disable LayerNorm fp32 upcast: {e}")
+
+
+def layer_norm(
+    hidden_states: Any,
+    normalized_shape: int,
+    weight: Optional[Any] = None,
+    bias: Optional[Any] = None,
+    epsilon: float = 1e-5,
+) -> Any:
+    """Functional LayerNorm with fp32 upcast.
+
+    Args:
+        hidden_states: Input tensor (..., normalized_shape).
+        normalized_shape: Size of the last dimension.
+        weight: Optional scale parameter.
+        bias: Optional shift parameter.
+        epsilon: Small constant for numerical stability.
+
+    Returns:
+        Normalized tensor with same shape as input.
+
+    Example:
+        >>> from daca.nn.layernorm import layer_norm
+        >>> normalized = layer_norm(x, 768, weight=gamma, bias=beta)
+    """
+    try:
+        import mindspore.ops as ops
+        import mindspore.common.dtype as mstype
+    except ImportError:
+        raise ImportError("MindSpore is required for layer_norm")
+
+    original_dtype = hidden_states.dtype
+
+    # Upcast to fp32 for stability
+    if original_dtype == mstype.float16:
+        hidden_states = ops.cast(hidden_states, mstype.float32)
+
+    # Compute mean and variance
+    mean = ops.mean(hidden_states, axis=-1, keep_dims=True)
+    variance = ops.mean(
+        ops.pow(hidden_states - mean, 2),
+        axis=-1,
+        keep_dims=True
+    )
+
+    # Normalize
+    hidden_states = (hidden_states - mean) / ops.sqrt(variance + epsilon)
+
+    # Apply affine transformation
+    if weight is not None:
+        weight = ops.cast(weight, hidden_states.dtype)
+        hidden_states = hidden_states * weight
+    if bias is not None:
+        bias = ops.cast(bias, hidden_states.dtype)
+        hidden_states = hidden_states + bias
+
+    # Cast back
+    if original_dtype == mstype.float16:
+        hidden_states = ops.cast(hidden_states, original_dtype)
+
+    return hidden_states

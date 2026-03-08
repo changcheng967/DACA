@@ -16,7 +16,7 @@ Example:
 """
 
 import logging
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Any
 
 logger = logging.getLogger("daca.blas.matmul")
 
