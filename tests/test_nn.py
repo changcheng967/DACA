@@ -1,0 +1,287 @@
+"""Tests for DACA NN module."""
+
+import pytest
+
+# Skip all tests in this module if MindSpore not available
+pytestmark = pytest.mark.mindspore
+
+
+class TestFlashAttention:
+    """Tests for FlashAttention."""
+
+    def test_flash_attention_create(self):
+        """Test FlashAttention creation."""
+        from daca.nn import FlashAttention
+
+        attn = FlashAttention(head_dim=64, num_heads=32)
+
+        assert attn.head_dim == 64
+        assert attn.num_heads == 32
+
+    def test_flash_attention_forward(self, sample_attention_inputs):
+        """Test FlashAttention forward pass."""
+        from daca.nn import FlashAttention
+
+        q, k, v = sample_attention_inputs
+        batch, heads, seq, dim = q.shape
+
+        attn = FlashAttention(head_dim=dim, num_heads=heads)
+        output = attn(q, k, v)
+
+        assert output.shape == q.shape
+
+    def test_scaled_dot_product_attention(self, sample_attention_inputs):
+        """Test scaled_dot_product_attention."""
+        from daca.nn import scaled_dot_product_attention
+
+        q, k, v = sample_attention_inputs
+        output = scaled_dot_product_attention(q, k, v)
+
+        assert output.shape == q.shape
+
+    def test_repeat_kv(self):
+        """Test repeat_kv for GQA."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import repeat_kv
+
+        # (batch, num_kv_heads, seq, head_dim)
+        x = Tensor(ms.numpy.ones((2, 4, 8, 16)), mstype.float16)
+
+        result = repeat_kv(x, n_rep=2)
+
+        assert result.shape == (2, 8, 8, 16)
+
+
+class TestLayerNorm:
+    """Tests for LayerNorm."""
+
+    def test_layernorm_create(self):
+        """Test LayerNorm creation."""
+        from daca.nn import LayerNorm
+
+        ln = LayerNorm(normalized_shape=768)
+
+        assert ln.normalized_shape == 768
+
+    def test_layernorm_forward(self, sample_tensor):
+        """Test LayerNorm forward pass."""
+        from daca.nn import LayerNorm
+
+        ln = LayerNorm(normalized_shape=8)
+        output = ln(sample_tensor)
+
+        assert output.shape == sample_tensor.shape
+
+    def test_layernorm_fp32_upcast(self):
+        """Test that LayerNorm uses FP32 internally."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import LayerNorm
+
+        x = Tensor(ms.numpy.random.randn(2, 4, 8), mstype.float16)
+        ln = LayerNorm(normalized_shape=8)
+
+        # Should not crash even with FP16 input
+        output = ln(x)
+
+        assert output.dtype == mstype.float16
+
+
+class TestRMSNorm:
+    """Tests for RMSNorm."""
+
+    def test_rmsnorm_create(self):
+        """Test RMSNorm creation."""
+        from daca.nn import RMSNorm
+
+        rms = RMSNorm(hidden_size=768)
+
+        assert rms.hidden_size == 768
+
+    def test_rmsnorm_forward(self, sample_tensor):
+        """Test RMSNorm forward pass."""
+        from daca.nn import RMSNorm
+
+        rms = RMSNorm(hidden_size=8)
+        output = rms(sample_tensor)
+
+        assert output.shape == sample_tensor.shape
+
+
+class TestActivations:
+    """Tests for activations."""
+
+    def test_silu(self, sample_tensor):
+        """Test SiLU activation."""
+        from daca.nn import silu
+
+        output = silu(sample_tensor)
+
+        assert output.shape == sample_tensor.shape
+
+    def test_silu_manual(self, sample_tensor):
+        """Test manual SiLU implementation: x * sigmoid(x)."""
+        import mindspore.ops as ops
+        from daca.nn import silu
+
+        output = silu(sample_tensor)
+        expected = sample_tensor * ops.sigmoid(sample_tensor)
+
+        # Should be close
+        assert output.shape == expected.shape
+
+    def test_swiglu(self):
+        """Test SwiGLU activation."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import swiglu
+
+        x = Tensor(ms.numpy.random.randn(2, 4, 16), mstype.float16)
+        output = swiglu(x, dim=-1)
+
+        # Output should be half the size
+        assert output.shape == (2, 4, 8)
+
+    def test_inject_silu(self):
+        """Test SiLU injection into ops namespace."""
+        from daca.nn import inject_silu, remove_silu
+
+        inject_silu()
+
+        try:
+            import mindspore.ops as ops
+            assert hasattr(ops, "silu")
+        finally:
+            remove_silu()
+
+
+class TestRotary:
+    """Tests for rotary embeddings."""
+
+    def test_rotary_embedding_create(self):
+        """Test RotaryEmbedding creation."""
+        from daca.nn import RotaryEmbedding
+
+        rotary = RotaryEmbedding(dim=64, max_seq_len=2048)
+
+        assert rotary.dim == 64
+        assert rotary.max_seq_len == 2048
+
+    def test_rotary_embedding_forward(self):
+        """Test RotaryEmbedding forward."""
+        from daca.nn import RotaryEmbedding
+
+        rotary = RotaryEmbedding(dim=64, max_seq_len=2048)
+        cos, sin = rotary(512)
+
+        assert cos.shape == (512, 64)
+        assert sin.shape == (512, 64)
+
+    def test_apply_rotary_pos_emb(self):
+        """Test apply_rotary_pos_emb."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import RotaryEmbedding, apply_rotary_pos_emb
+
+        rotary = RotaryEmbedding(dim=16, max_seq_len=64)
+        cos, sin = rotary(8)
+
+        x = Tensor(ms.numpy.random.randn(2, 4, 8, 16), mstype.float16)
+        rotated = apply_rotary_pos_emb(x, cos, sin)
+
+        assert rotated.shape == x.shape
+
+
+class TestSoftmax:
+    """Tests for softmax."""
+
+    def test_softmax(self, sample_tensor):
+        """Test softmax."""
+        from daca.nn import softmax
+
+        output = softmax(sample_tensor, axis=-1)
+
+        assert output.shape == sample_tensor.shape
+
+    def test_softmax_sums_to_one(self):
+        """Test that softmax sums to 1."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import softmax
+
+        x = Tensor(ms.numpy.random.randn(2, 4), mstype.float16)
+        output = softmax(x, axis=-1)
+
+        # Sum along axis should be ~1
+        sums = ms.numpy.sum(output, axis=-1)
+
+        for s in sums:
+            assert abs(float(s) - 1.0) < 0.1  # Allow some fp16 error
+
+    def test_log_softmax(self, sample_tensor):
+        """Test log_softmax."""
+        from daca.nn import log_softmax
+
+        output = log_softmax(sample_tensor, axis=-1)
+
+        assert output.shape == sample_tensor.shape
+
+
+class TestEmbedding:
+    """Tests for embedding."""
+
+    def test_embedding_create(self):
+        """Test Embedding creation."""
+        from daca.nn import Embedding
+
+        emb = Embedding(vocab_size=1000, embedding_dim=64)
+
+        assert emb.vocab_size == 1000
+        assert emb.embedding_dim == 64
+
+    def test_embedding_forward(self):
+        """Test Embedding forward."""
+        import mindspore as ms
+        from mindspore import Tensor
+        import mindspore.common.dtype as mstype
+        from daca.nn import Embedding
+
+        emb = Embedding(vocab_size=100, embedding_dim=32)
+
+        indices = Tensor([[1, 2, 3], [4, 5, 6]], mstype.int32)
+        output = emb(indices)
+
+        assert output.shape == (2, 3, 32)
+
+
+# Fixtures
+@pytest.fixture
+def sample_tensor():
+    """Create sample tensor for testing."""
+    import mindspore as ms
+    from mindspore import Tensor
+    import mindspore.common.dtype as mstype
+
+    return Tensor(ms.numpy.random.randn(2, 4, 8), mstype.float16)
+
+
+@pytest.fixture
+def sample_attention_inputs():
+    """Create sample attention inputs."""
+    import mindspore as ms
+    from mindspore import Tensor
+    import mindspore.common.dtype as mstype
+
+    batch, heads, seq, dim = 2, 4, 8, 16
+
+    q = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+    k = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+    v = Tensor(ms.numpy.random.randn(batch, heads, seq, dim), mstype.float16)
+
+    return q, k, v
