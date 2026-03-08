@@ -51,13 +51,27 @@ This document tracks the gap between common AI operators and their availability 
 
 | Operation | Status | Native | Workaround | Notes |
 |-----------|--------|--------|------------|-------|
-| FlashAttentionScore | ✅ Working | Yes | - | Native kernel works |
-| ScaledDotProductAttention | ✅ Working | No | BMM path | Manual implementation |
+| FlashAttentionScore (forward) | ✅ Working | Yes | - | Forward pass works |
+| **FlashAttentionScore (backward)** | ❌ **NO BACKWARD** | No | Chunked attention | Atlas A2 only, 910ProA has NO backward |
+| **Chunked Online Softmax** | ✅ Working | No | DaCAAttention | FlashAttention-equivalent, pure MindSpore |
+| ScaledDotProductAttention | ✅ Working | No | BMM path | Manual implementation (OOM for large S) |
 | MultiHeadAttention | ✅ Working | Yes | - | MindSpore builtin |
 | CrossAttention | ✅ Working | Yes | - | Encoder-decoder |
 | SelfAttention | ✅ Working | Yes | - | Standard |
 | Sliding Window Attention | ⚠️ Partial | No | Manual mask | Custom implementation |
-| FlashAttention-2 | ❓ Unknown | ? | - | Check CANN version |
+
+#### ⚠️ CRITICAL: FlashAttentionScore Has NO Backward Pass on 910ProA
+
+The native `ops.FlashAttentionScore` kernel is **forward-only** on Ascend 910ProA. The backward
+pass (needed for training) is only available on Atlas A2 hardware.
+
+**Impact**: Using native FlashAttention during training will crash with:
+```
+RuntimeError: The gradient operator [FlashAttentionScoreGrad] not found
+```
+
+**Solution**: Use `DaCAAttention` which implements the FlashAttention algorithm
+in pure MindSpore ops that all have backward support on 910ProA.
 
 ### Embeddings
 
@@ -184,9 +198,51 @@ os.environ["ASCEND_DISABLE_FLASH_ATTENTION_FUSION"] = "1"
 
 1. **Use FP16 everywhere** except LayerNorm
 2. **Prefer native ops** when available
-3. **Use FlashAttention** kernel (it works!)
-4. **Avoid BF16** completely
-5. **Test new ops** before assuming they work
+3. **Use DaCAAttention** for all attention (FlashAttention-equivalent, supports backward)
+4. **Avoid native FlashAttentionScore** during training (no backward on 910ProA)
+5. **Avoid BF16** completely
+6. **Test new ops** before assuming they work
+
+## Memory Comparison: Attention Methods
+
+For Qwen3-8B style attention (seq=4096, num_heads=32, head_dim=128):
+
+| Method | Memory per layer | Total 36 layers | Fits 32GB? | Backward? |
+|--------|-----------------|-----------------|------------|-----------|
+| Naive BMM-Softmax-BMM | ~1 GB | ~36 GB | ❌ **NO** | ✅ Yes |
+| Chunked (chunk=256) | ~4 MB | ~144 MB | ✅ **YES** | ✅ Yes |
+| Native FlashAttention | ~0 (fused) | ~0 | N/A | ❌ **NO** |
+
+### Why Naive Attention OOMs
+
+The naive attention implementation materializes the full attention matrix:
+
+```python
+# Naive attention - DO NOT USE for large sequences
+scores = q @ k.transpose(-1, -2) * scale  # [B, H, S, S] - materializes full matrix!
+attn = softmax(scores)
+output = attn @ v
+```
+
+For S=4096, H=32, batch=1:
+- scores shape: [1, 32, 4096, 4096] = 536M elements
+- FP16: 536M × 2 bytes = **~1 GB per layer**
+- 36 layers × 1 GB = **~36 GB total** > 32 GB HBM → OOM
+
+### Chunked Online Softmax (DaCAAttention)
+
+Instead of materializing the full S×S matrix, process in chunks:
+
+```python
+# Chunked attention - DaCAAttention
+for q_block in range(0, S, chunk_size):
+    for kv_block in range(0, S, chunk_size):
+        # Only materialize [B, H, chunk, chunk] at a time
+        scores = q_block @ kv_block.T * scale  # [B, H, 256, 256] - tiny!
+        # Online softmax update...
+```
+
+Memory: O(chunk²) instead of O(S²) = 256² vs 4096² = **256KB vs 1GB**
 
 ## Contributing
 

@@ -5,6 +5,65 @@ All notable changes to DACA will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-03-08
+
+### Fixed
+
+#### CRITICAL: Chunked Online Softmax Attention
+- **Memory-efficient attention for 910ProA**: Replaced naive BMM-Softmax-BMM with
+  chunked online softmax attention (FlashAttention algorithm in pure MindSpore)
+- **OOM fix for large sequences**: Naive attention materializes full S×S matrix.
+  For Qwen3-8B (S=4096, H=32): ~1GB/layer × 36 layers = 36GB > 32GB HBM → OOM.
+  Chunked approach uses only ~4MB/layer.
+- **Backward pass support**: Native FlashAttentionScore has NO backward pass on
+  910ProA (Atlas A2 only). Chunked implementation uses only ops with gradients.
+- Added `DaCAAttention` class with:
+  - Chunked online softmax algorithm (Milakov & Gimelshein 2018)
+  - GQA support (different num_heads vs num_kv_heads)
+  - Causal masking with block-skip optimization
+  - Numerical stability via fp32 upcast for softmax
+  - Both [B,H,S,D] and [B,S,H,D] input layouts
+
+### Changed
+
+#### Documentation Updates
+- Updated `daca/docs/operator_gap.md`:
+  - Documented FlashAttentionScore NO backward pass on 910ProA
+  - Added memory comparison table (naive vs chunked vs native)
+  - Explained chunked attention algorithm
+
+#### Neural Network Module (`daca.nn`)
+- `DaCAAttention` is now the primary attention class
+- `FlashAttention` is an alias for `DaCAAttention` (backward compatible)
+- `scaled_dot_product_attention` now uses chunked attention
+
+### Memory Comparison
+
+| Method | Memory per layer (S=4096, H=32) | Total 36 layers | Fits 32GB? |
+|--------|--------------------------------|-----------------|------------|
+| Naive BMM-Softmax-BMM | ~1GB | ~36GB | **NO** |
+| Chunked (chunk=256) | ~4MB | ~144MB | **YES** |
+| Native FlashAttention | ~0 (fused) | ~0 | N/A (broken) |
+
+### Technical Details
+
+The chunked online softmax algorithm processes Q and K/V in small tiles:
+
+```
+For each q_block (256 tokens):
+    Initialize: m = -inf (running max), l = 0 (running sum), o = 0 (running output)
+    For each kv_block (256 tokens):
+        s = q_block @ k_block.T * scale        # [B,H,256,256] — only 256KB!
+        m_new = max(m, rowmax(s))
+        p = exp(s - m_new)                      # numerically stable
+        l_new = exp(m - m_new) * l + rowsum(p)
+        o = rescale(o) + p @ v_block
+        m, l = m_new, l_new
+    output[q_block_range] = o
+```
+
+Memory: O(q_chunk × kv_chunk) = O(256 × 256) instead of O(4096 × 4096).
+
 ## [0.1.0] - 2026-03-08
 
 ### Added

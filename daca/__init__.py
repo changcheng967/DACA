@@ -18,7 +18,7 @@ Example:
     daca.unpatch()
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "DACA Contributors"
 __license__ = "Apache-2.0"
 
@@ -76,7 +76,7 @@ def info() -> None:
         >>> daca.info()
         ╔═══════════════════════════════════════════════════════════╗
         ║  DACA - DaVinci Accelerated Compute Architecture          ║
-        ║  Version: 0.1.0                                           ║
+        ║  Version: 0.1.1                                           ║
         ║  Ascend NPU Platform Library                              ║
         ╚═══════════════════════════════════════════════════════════╝
     """
@@ -87,6 +87,9 @@ def info() -> None:
 ║  Ascend NPU Platform Library                                  ║
 ║                                                               ║
 ║  "DACA is to Ascend what CUDA is to NVIDIA"                   ║
+║                                                               ║
+║  DaCAAttention: Chunked Online Softmax Attention              ║
+║  (FlashAttention-equivalent, pure MindSpore, w/ backward)     ║
 ╚═══════════════════════════════════════════════════════════════╝
 """
     print(banner)

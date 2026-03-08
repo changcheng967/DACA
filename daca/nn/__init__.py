@@ -3,7 +3,8 @@
 Core NN layers with Ascend-specific fixes and optimizations.
 
 Key components:
-- FlashAttention: Native kernel wrapper with BMM fallback
+- DaCAAttention: Chunked online softmax attention (FlashAttention-equivalent, pure MindSpore)
+- FlashAttention: Alias for DaCAAttention (backward compatible)
 - LayerNorm: fp32 upcast to avoid CANN fusion bug
 - RMSNorm: Manual decomposition using rsqrt + mul + mul
 - activations: Missing ops like SiLU, SwiGLU
@@ -11,6 +12,7 @@ Key components:
 """
 
 from daca.nn.attention import (
+    DaCAAttention,
     FlashAttention,
     scaled_dot_product_attention,
     repeat_kv,
@@ -41,6 +43,7 @@ from daca.nn.softmax import (
 
 __all__ = [
     # Attention
+    "DaCAAttention",
     "FlashAttention",
     "scaled_dot_product_attention",
     "repeat_kv",
